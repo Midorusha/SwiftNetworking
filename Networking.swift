@@ -33,6 +33,8 @@ func ==(lhs: ThreadEnum, rhs: ThreadEnum) -> Bool {
 }
 
 typealias networkCompletion = ((response: NetworkResponse?, error: NSError?) -> NetworkRequest?)
+typealias clusterCompletion = (responses: [(NetworkResponse?, NSError?)]?) -> NetworkRequest?
+
 protocol NetworkResponse {
     //var returningThread: ThreadEnum { get }
     var returningQueue: dispatch_queue_t? { get set }
@@ -47,7 +49,18 @@ protocol DataResponse: NetworkResponse {
     func populateWithData(data: NSData?)
 }
 
-class NetworkRequest: NSMutableURLRequest {
+protocol BLEResponse: NetworkResponse {
+    func populateWithCharacteristic(data: NSData?)
+}
+
+
+protocol NetworkRequest {
+    var priority: Int { get set }
+}
+
+class WebRequest: NSMutableURLRequest, NetworkRequest {
+    var priority: Int = 0
+    
     init?(_ verb: HTTPVerb, _ urlString: String) {
         super.init(coder: NSCoder())
         guard let url = NSURL(string: urlString) else {
@@ -63,23 +76,36 @@ class NetworkRequest: NSMutableURLRequest {
     
 }
 
+class BLERequest: NetworkRequest {
+    var priority: Int = 0
+    
+}
+
 class NetworkNode {
-    var request: NetworkRequest
+    var request: NetworkRequest?
     var response: NetworkResponse?
     var completion: networkCompletion?
     var nextNetworkNode: NetworkNode?
     var prevNetworkNode: NetworkNode?
     
-    init(request: NetworkRequest, response: NetworkResponse?, completion: networkCompletion?) {
-        self.request = request
-        self.response = response
-        self.completion = completion
+    init() {
         nextNetworkNode = nil
         prevNetworkNode = nil
     }
     
-    func andThen(request: NetworkRequest, response: NetworkResponse? = nil, completion: networkCompletion?) -> NetworkNode {
+    convenience init(request: NetworkRequest?, response: NetworkResponse?, completion: networkCompletion?) {
+        self.init()
+        self.request = request
+        self.response = response
+        self.completion = completion
+    }
+    
+    func andThen(request: NetworkRequest? = nil, response: NetworkResponse? = nil, completion: networkCompletion?) -> NetworkNode {
         return andThen(NetworkNode(request: request, response: response, completion: completion))
+    }
+    
+    func andThen(requests: (NetworkRequest, NetworkResponse?)..., completion: clusterCompletion) -> NetworkNode {
+        return andThen(ClusterNetworkNode(requests: requests, completion: completion))
     }
     
     func andThen(nextNode: NetworkNode) -> NetworkNode {
@@ -88,28 +114,98 @@ class NetworkNode {
         return nextNode
     }
     
-    func start() {
+    final func start() {
         var cur = self
         while(cur.prevNetworkNode != nil) {
             cur = prevNetworkNode!
         }
-        NetworkCall.call(cur)
+        cur.call()
+    }
+    
+    func call() {
+        if request is WebRequest {
+            NetworkCall.call(self)
+        }
+        else if request is BLERequest {
+            //TODO BLECall.call(cur)
+        }
+    }
+}
+
+class ClusterNetworkNode: NetworkNode {
+    var fullCompletion: clusterCompletion?
+    var callsCompleted: Int = 0
+    var childNetworkNodes: [NetworkNode] = []
+    var completionTuples: [(NetworkResponse?, NSError?)] = []
+    override var request: NetworkRequest? {
+        willSet {
+            fatalError("NO")
+        }
+    }
+    
+    override var completion: networkCompletion? {
+        willSet {
+            fatalError("NO")
+        }
+    }
+    
+    init(requests: [(NetworkRequest, NetworkResponse?)], completion: clusterCompletion?) {
+        fullCompletion = completion
+        for request in requests {
+            childNetworkNodes.append(NetworkNode(request: request.0, response: request.1, completion: nil))
+        }
+        super.init()
+    }
+    
+    override func call() {
+        let fauxCompletion = {
+            [weak self] (response: NetworkResponse?, error: NSError?) -> NetworkRequest? in
+                guard let this = self else {
+                    return nil
+                }
+                this.completionTuples.append((response, error))
+                this.callsCompleted += 1
+                if this.childNetworkNodes.count == this.callsCompleted {
+                    if let nextRequest = this.fullCompletion?(responses: this.completionTuples) {
+                        this.nextNetworkNode?.request = nextRequest
+                    }
+                    if let nextNode = this.nextNetworkNode {
+                        nextNode.call()
+                    }
+                }
+                return nil
+            }
+        for node in childNetworkNodes {
+            node.completion = fauxCompletion
+            node.call()
+        }
     }
 }
 
 class NetworkCall {
+    private static var outGoingPriorityRequest: WebRequest?
     static func call(node: NetworkNode) {
-        NSURLSession.sharedSession().dataTaskWithRequest(node.request) {
+        guard let request = node.request as? WebRequest else {
+            return
+        }
+        
+        if request.priority >= outGoingPriorityRequest?.priority {
+            outGoingPriorityRequest = request
+        }
+
+        NSURLSession.sharedSession().dataTaskWithRequest(request) {
             (data: NSData?, response: NSURLResponse?, error: NSError?) -> Void in
             defer {
-                if let returningQueue = node.response?.returningQueue {
+                if let returningQueue = node.response?.returningQueue
+                    where request.priority >= outGoingPriorityRequest?.priority {
+                    outGoingPriorityRequest = nil
                     dispatch_async(returningQueue, {
                         () -> Void in
                         if let nextRequest = node.completion?(response: node.response, error: error) {
                             node.nextNetworkNode?.request = nextRequest
                         }
-                        if let nextNode = node.nextNetworkNode {
-                            call(nextNode)
+                        if var nextNode = node.nextNetworkNode {
+                            nextNode.call()
                         }
                     })
                 }
@@ -136,13 +232,31 @@ func foo() {
         var returningQueue: dispatch_queue_t? = dispatch_get_main_queue()
     }
     
-    let r = NetworkRequest(.GET, "google.com")
+    let r = WebRequest(.GET, "google.com")
     
     NetworkNode(request: r!, response: R()) {
         (response, error) -> NetworkRequest? in
         return nil
     }.andThen(r!) {
         (response, error) -> NetworkRequest? in
+        return nil
+    }.start()
+    
+    NetworkNode(request: r!, response: R()) {
+        (response, error) -> NetworkRequest? in
+        return r
+    }.andThen(response: R()) {
+        (response, error) -> NetworkRequest? in
+        return nil
+    }.andThen(r!) {
+        (response, error) -> NetworkRequest? in
+        return nil
+    }.andThen {
+        (response, error) -> NetworkRequest? in
+        return nil
+    }.andThen((r!, R()), (r!, nil)) {
+        (responses: [(NetworkResponse?, NSError?)]?) -> NetworkRequest? in
+            
         return nil
     }.start()
 }
