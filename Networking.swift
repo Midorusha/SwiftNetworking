@@ -8,12 +8,6 @@
 
 import Foundation
 
-enum ThreadEnum: Equatable {
-    case Main
-    case Ambiguous
-    case Custom(dispatch_queue_t)
-}
-
 enum HTTPVerb: String {
     case POST   = "POST"
     case GET    = "GET"
@@ -21,32 +15,49 @@ enum HTTPVerb: String {
     case DELETE = "DELETE"
 }
 
-func ==(lhs: ThreadEnum, rhs: ThreadEnum) -> Bool {
-    switch(lhs, rhs) {
-    case (.Main, .Main):
-        fallthrough
-    case (.Ambiguous, .Ambiguous):
-        return true
-    default:
-        return false
-    }
+enum ClearCallQueue {
+    case None
+    case Web
+    case BLE
+    case Both
 }
 
 typealias networkCompletion = ((response: NetworkResponse?, error: NSError?) -> NetworkRequest?)
 typealias clusterCompletion = (responses: [(NetworkResponse?, NSError?)]?) -> NetworkRequest?
 
 protocol NetworkResponse {
-    //var returningThread: ThreadEnum { get }
     var returningQueue: dispatch_queue_t? { get set }
-    
+    func populateWithData(data: NSData)
 }
 
 protocol JsonResponse: NetworkResponse {
     func populateWithJSON(json: [String : AnyObject?]?)
 }
 
+extension JsonResponse {
+    func populateWithData(data: NSData) {
+        do {
+            let json = try NSJSONSerialization.JSONObjectWithData(data, options: NSJSONReadingOptions.MutableContainers) as? Dictionary<String, AnyObject>
+            populateWithJSON(json)
+        } catch {
+            // TO THROW OR NOT TO THRO
+            print(error)
+        }
+    }
+}
+
 protocol DataResponse: NetworkResponse {
     func populateWithData(data: NSData?)
+}
+
+protocol XMLResponse: NetworkResponse {
+    func populateWithXML(data: NSData?)
+}
+
+extension XMLResponse {
+    func populateWithData(data: NSData) {
+        populateWithXML(data)
+    }
 }
 
 protocol BLEResponse: NetworkResponse {
@@ -55,11 +66,18 @@ protocol BLEResponse: NetworkResponse {
 
 
 protocol NetworkRequest {
-    var priority: Int { get set }
+    var clearQueue: ClearCallQueue { get }
+    var timeStamp: Double { get }
+    func call(node: NetworkNode)
+}
+
+func ==(lhs: NetworkRequest?, rhs: NetworkRequest?) -> Bool {
+    return lhs?.timeStamp == rhs?.timeStamp
 }
 
 class WebRequest: NSMutableURLRequest, NetworkRequest {
-    var priority: Int = 0
+    var clearQueue: ClearCallQueue = .None
+    var timeStamp: Double = NSDate().timeIntervalSince1970
     
     init?(_ verb: HTTPVerb, _ urlString: String) {
         super.init(coder: NSCoder())
@@ -74,11 +92,18 @@ class WebRequest: NSMutableURLRequest, NetworkRequest {
         super.init(coder: aDecoder)
     }
     
+    func call(node: NetworkNode) {
+        NetworkCall.call(node)
+    }
 }
 
 class BLERequest: NetworkRequest {
-    var priority: Int = 0
+    var clearQueue: ClearCallQueue = .None
+    var timeStamp: Double = NSDate().timeIntervalSince1970
     
+    func call(node: NetworkNode) {
+        //TODO
+    }
 }
 
 class NetworkNode {
@@ -123,12 +148,7 @@ class NetworkNode {
     }
     
     func call() {
-        if request is WebRequest {
-            NetworkCall.call(self)
-        }
-        else if request is BLERequest {
-            //TODO BLECall.call(cur)
-        }
+        request?.call(self)
     }
 }
 
@@ -182,24 +202,55 @@ class ClusterNetworkNode: NetworkNode {
     }
 }
 
-class NetworkCall {
-    private static var outGoingPriorityRequest: WebRequest?
+struct BLECall {
     static func call(node: NetworkNode) {
-        guard let request = node.request as? WebRequest else {
+        // so who should keep track of the peripheral....
+        // and the characteristic....
+    }
+}
+
+struct Locker {
+    static var lockingNode: NetworkRequest?
+    static func enterLock(request: NetworkRequest) -> Bool {
+        if lockingNode == nil {
+            var shouldLock = false
+            switch (request.clearQueue) {
+            case .Both:
+                fallthrough
+            case .Web where request is WebRequest:
+                fallthrough
+            case .BLE where request is BLERequest:
+                shouldLock = true
+            default:
+                break
+            }
+            if shouldLock {
+                lockingNode = request
+            }
+            return true
+        }
+        return false
+    }
+    
+    static func exitLock(request: NetworkRequest) -> Bool {
+        if lockingNode == request {
+            lockingNode = nil
+        }
+        return (lockingNode == nil)
+    }
+}
+
+struct NetworkCall {
+    static func call(node: NetworkNode) {
+        guard let request = node.request as? WebRequest
+            where !Locker.enterLock(request) else {
             return
         }
-        
-        if request.priority >= outGoingPriorityRequest?.priority {
-            outGoingPriorityRequest = request
-        }
-
         NSURLSession.sharedSession().dataTaskWithRequest(request) {
             (data: NSData?, response: NSURLResponse?, error: NSError?) -> Void in
             defer {
-                if let returningQueue = node.response?.returningQueue
-                    where request.priority >= outGoingPriorityRequest?.priority {
-                    outGoingPriorityRequest = nil
-                    dispatch_async(returningQueue, {
+                if Locker.exitLock(request) {
+                    dispatch_async(node.response?.returningQueue ?? dispatch_get_main_queue(), {
                         () -> Void in
                         if let nextRequest = node.completion?(response: node.response, error: error) {
                             node.nextNetworkNode?.request = nextRequest
@@ -211,17 +262,7 @@ class NetworkCall {
                 }
             }
             if let data = data {
-                if let responseObject = node.response as? JsonResponse {
-                    do {
-                        let json = try NSJSONSerialization.JSONObjectWithData(data, options: NSJSONReadingOptions.MutableContainers) as? Dictionary<String, AnyObject>
-                        responseObject.populateWithJSON(json)
-                    } catch {
-                        print(error)
-                    }
-                }
-                else if let responseObject = node.response as? DataResponse {
-                    responseObject.populateWithData(data)
-                }
+                node.response?.populateWithData(data)
             }
         }.resume()
     }
@@ -229,7 +270,8 @@ class NetworkCall {
 
 func foo() {
     struct R: NetworkResponse {
-        var returningQueue: dispatch_queue_t? = dispatch_get_main_queue()
+        var returningQueue: dispatch_queue_t?
+        func populateWithData(data: NSData){}
     }
     
     let r = WebRequest(.GET, "google.com")
